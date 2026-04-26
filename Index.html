@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#0D2340" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="msapplication-tap-highlight" content="no" />
+  <title>SA Cladding — Panel Count</title>
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; padding: 0; background: #eef1f5; font-family: 'Roboto Mono', 'Courier New', monospace; }
+    body { overscroll-behavior: none; }
+    input, textarea, select, button { font-family: inherit; }
+    textarea { -webkit-appearance: none; }
+    button { touch-action: manipulation; -webkit-tap-highlight-color: transparent; cursor: pointer; }
+    input, textarea, select { -webkit-tap-highlight-color: transparent; }
+    /* Prevent double-tap zoom on buttons — critical for Samsung */
+    * { touch-action: pan-x pan-y; }
+    button, a { touch-action: manipulation; }
+    @keyframes pulse {
+      from { opacity: 1; transform: scale(1); }
+      to   { opacity: 0.3; transform: scale(0.6); }
+    }
+  </style>
+  <!-- React + Babel via CDN — works fully offline after first load -->
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useMemo, useRef, useCallback } = React;
+
+const NAVY  = "#0D2340";
+const ACCENT = "#2E7DBA";
+const GOLD  = "#F0C040";
+const SUCCESS = "#1A7A4A";
+const WARN  = "#E07820";
+
+const FACE_COLORS = ["#2E7DBA","#1A7A4A","#7B3FA0","#C0762B","#2B7C8C","#C0392B","#0D7377","#7A6020"];
+
+const MATERIALS = [
+  { id: "hebel",      label: "Hebel / AAC",      color: "#2E7DBA" },
+  { id: "blueboard",  label: "Blueboard / CFC",   color: "#1A7A4A" },
+  { id: "foam",       label: "Renderfoam / EPS",  color: "#7B3FA0" },
+  { id: "axon",       label: "Axon Cladding",     color: "#C0762B" },
+  { id: "harditex",   label: "Harditex",          color: "#2B7C8C" },
+  { id: "villaboard", label: "Villaboard",        color: "#0D7377" },
+  { id: "scyon",      label: "Scyon Linea",       color: "#7A6020" },
+  { id: "brick",      label: "Brick (measure)",   color: "#8B4A3A" },
+  { id: "stone",      label: "Stone (measure)",   color: "#6B6B6B" },
+  { id: "other",      label: "Other",             color: "#444444" },
+];
+const MAT = Object.fromEntries(MATERIALS.map(m => [m.id, m]));
+
+
+// ── Voice helpers ──────────────────────────────────────────────────────
+const WORD_NUMS = {
+  zero:0,one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:9,
+  ten:10,eleven:11,twelve:12,thirteen:13,fourteen:14,fifteen:15,
+  sixteen:16,seventeen:17,eighteen:18,nineteen:19,twenty:20,
+  thirty:30,forty:40,fifty:50,sixty:60,seventy:70,eighty:80,ninety:90,
+  hundred:100,thousand:1000,
+};
+
+function wordsToNum(str) {
+  // Try direct parse first
+  const direct = parseFloat(str.replace(/,/g,""));
+  if (!isNaN(direct)) return direct;
+  // Word conversion
+  const tokens = str.toLowerCase().trim().split(/\s+/);
+  let total = 0, current = 0;
+  for (const t of tokens) {
+    const n = WORD_NUMS[t];
+    if (n === undefined) return null;
+    if (n === 100) { current = current === 0 ? 100 : current * 100; }
+    else if (n === 1000) { total += (current === 0 ? 1 : current) * 1000; current = 0; }
+    else { current += n; }
+  }
+  return total + current || null;
+}
+
+function processVoiceTranscript(transcript) {
+  // Normalise separators: "by", "x", "times", "cross" → " x "
+  let t = transcript.toLowerCase().trim();
+  t = t.replace(/\b(by|times|cross|multiplied by)\b/gi, " x ");
+  t = t.replace(/[×*]/g, " x ");
+  // Replace written numbers with digits
+  t = t.replace(/[a-z]+/g, w => {
+    const n = WORD_NUMS[w];
+    return n !== undefined ? String(n) : w;
+  });
+  // Collapse spaces
+  t = t.replace(/\s+/g, " ").trim();
+  // Try to find dim x qty [label] pattern
+  const m = t.match(/^([\d.]+)\s*x\s*([\d.]+)(.*)?$/i);
+  if (!m) return null;
+  const dim = m[1].trim();
+  const qty = m[2].trim();
+  const label = (m[3] || "").trim().replace(/^[-:,\s]+/, "").trim();
+  return label ? `${dim}x${qty} ${label}` : `${dim}x${qty}`;
+}
+
+
+// ── Parser ─────────────────────────────────────────────────────────────
+function parseLine(raw) {
+  const line = raw.trim();
+  if (!line || line.startsWith("//") || line.startsWith("#")) return null;
+
+  const match = line.match(/^([\d.]+)\s*[x×*]\s*([\d.]+)(.*)?$/i);
+  if (!match) return null;
+
+  let dim = parseFloat(match[1]);
+  let qty = parseFloat(match[2]);
+  const label = (match[3] || "").trim().replace(/^[-–—:,]+\s*/, "").trim();
+
+  if (!dim || !qty || isNaN(dim) || isNaN(qty) || dim <= 0 || qty <= 0) return null;
+
+  if (dim < 100) dim = Math.round(dim * 1000);
+  else dim = Math.round(dim);
+  qty = Math.round(qty);
+
+  if (isNaN(dim) || isNaN(qty) || dim <= 0 || qty <= 0) return null;
+
+  return { dim, qty, label, raw: line };
+}
+
+let _id = 0;
+const uid = () => ++_id;
+const newFace = (name = "", color = FACE_COLORS[0]) => ({
+  id: uid(), name, color, text: "", material: "hebel",
+});
+
+// ── App ────────────────────────────────────────────────────────────────
+function App() {
+  const [jobName,     setJobName]     = useState("");
+  const [date,        setDate]        = useState(new Date().toISOString().split("T")[0]);
+  const [teamLeader,  setTeamLeader]  = useState("");
+  const [faces,       setFaces]       = useState([newFace("Right Side", FACE_COLORS[0])]);
+  const [tab,         setTab]         = useState("enter");
+  const [copied,      setCopied]      = useState(false);
+  const [listeningId,  setListeningId]  = useState(null);
+  const [voiceStatus,  setVoiceStatus]   = useState("");   // status message
+  const [voiceSupported, setVoiceSupported] = useState(
+    !!(window.SpeechRecognition || window.webkitSpeechRecognition)
+  );
+  const recognitionRef = useRef(null);
+  const facesRef       = useRef(faces);
+  facesRef.current = faces;  // always current — avoids stale closure on Samsung
+
+  const stopVoice = () => {
+    try { if (recognitionRef.current) recognitionRef.current.abort(); } catch(e) {}
+    recognitionRef.current = null;
+    setListeningId(null);
+    setVoiceStatus("");
+  };
+
+  const startVoice = (faceId) => {
+    // Toggle off if already listening to this face
+    if (listeningId === faceId) { stopVoice(); return; }
+    // Stop any existing session first
+    if (recognitionRef.current) stopVoice();
+
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      setVoiceSupported(false);
+      return;
+    }
+
+    const rec = new SR();
+    // Samsung Internet + Chrome Android both support en-AU via webkit prefix
+    rec.lang            = "en-AU";
+    rec.continuous      = false;   // single utterance — most reliable on Samsung
+    rec.interimResults  = false;   // wait for final result
+    rec.maxAlternatives = 3;       // try alternatives if first parse fails
+
+    recognitionRef.current = rec;
+    setListeningId(faceId);
+    setVoiceStatus("Listening…");
+
+    rec.onstart = () => setVoiceStatus("Listening…");
+
+    rec.onresult = (event) => {
+      // Try each alternative until one parses
+      let line = null;
+      for (let i = 0; i < event.results[0].length; i++) {
+        const raw = event.results[0][i].transcript;
+        const processed = processVoiceTranscript(raw);
+        if (processed) { line = processed; break; }
+        if (!line) line = raw; // fallback to raw if nothing parses
+      }
+      setVoiceStatus("Got: " + line);
+      // Read current text from ref to avoid stale closure
+      const currentText = (facesRef.current.find(f => f.id === faceId) || {}).text || "";
+      const newText = currentText
+        ? currentText.replace(/\n+$/, "") + "\n" + line
+        : line;
+      setFaces(prev => prev.map(f => f.id === faceId ? { ...f, text: newText } : f));
+      setTimeout(() => setVoiceStatus(""), 1800);
+    };
+
+    rec.onnomatch = () => setVoiceStatus("Couldn't hear that — try again");
+
+    rec.onerror = (e) => {
+      const msgs = {
+        "not-allowed":    "Microphone blocked — allow mic in browser settings",
+        "no-speech":      "No speech detected — tap and speak",
+        "network":        "Network error — try again",
+        "audio-capture":  "No microphone found",
+        "service-not-allowed": "Speech service blocked — use Chrome",
+      };
+      setVoiceStatus(msgs[e.error] || "Error: " + e.error);
+      recognitionRef.current = null;
+      setListeningId(null);
+      setTimeout(() => setVoiceStatus(""), 3000);
+    };
+
+    rec.onend = () => {
+      recognitionRef.current = null;
+      setListeningId(null);
+      // Don't clear status — keep "Got: ..." visible briefly
+    };
+
+    try {
+      rec.start();
+    } catch(e) {
+      setVoiceStatus("Could not start — tap again");
+      recognitionRef.current = null;
+      setListeningId(null);
+    }
+  };
+
+  // ── Parse ──────────────────────────────────────────────────────────
+  const parsedFaces = useMemo(() =>
+    faces.map(f => {
+      const lines = f.text.split("\n");
+      const zones = lines
+        .map(l => { const p = parseLine(l); return p || null; })
+        .filter(Boolean);
+      const errors = lines.filter(l => {
+        const t = l.trim();
+        return t && !t.startsWith("//") && !t.startsWith("#") && !parseLine(t);
+      });
+      return { ...f, zones, errors };
+    }), [faces]);
+
+  // ── Grand totals ───────────────────────────────────────────────────
+  const grandTotals = useMemo(() => {
+    const map = {};
+    parsedFaces.forEach(f => {
+      f.zones.forEach(z => {
+        if (!map[z.dim]) map[z.dim] = { dim: z.dim, qty: 0, entries: [] };
+        map[z.dim].qty += z.qty;
+        map[z.dim].entries.push({ faceName: f.name, color: f.color, qty: z.qty, label: z.label, material: f.material });
+      });
+    });
+    return Object.values(map).sort((a, b) => b.dim - a.dim);
+  }, [parsedFaces]);
+
+  const totalPanels = grandTotals.reduce((s, r) => s + r.qty, 0);
+
+  // ── Mutations ──────────────────────────────────────────────────────
+  const updateFace = (id, field, val) =>
+    setFaces(f => f.map(x => x.id === id ? { ...x, [field]: val } : x));
+  const removeFace = id => setFaces(f => f.filter(x => x.id !== id));
+  const addFace = () => {
+    const color = FACE_COLORS[faces.length % FACE_COLORS.length];
+    setFaces(f => [...f, newFace("", color)]);
+  };
+
+  // ── Copy ───────────────────────────────────────────────────────────
+  const copySummary = () => {
+    const lines = [
+      `SA CLADDING — PANEL COUNT`,
+      `Job: ${jobName || "—"}   Date: ${date}   TL: ${teamLeader || "—"}`,
+      ``,
+      `PANEL TOTALS BY SIZE:`,
+      ...grandTotals.map(r => {
+        const labelled = r.entries.filter(e => e.label);
+        const base = `  ${r.dim}mm  x  ${r.qty} panels`;
+        if (!labelled.length) return base;
+        const detail = labelled.map(e => `      ${e.faceName}: ${e.qty} x ${e.label}`).join("\n");
+        return base + "\n" + detail;
+      }),
+      ``,
+      `TOTAL PANELS: ${totalPanels}`,
+      ``,
+      `BREAKDOWN BY ELEVATION:`,
+      ...parsedFaces.filter(f => f.zones.length).map(f => {
+        const matLabel = (MATERIALS.find(m => m.id === f.material) || MATERIALS[0]).label;
+        const rows = f.zones.map(z =>
+          `    ${z.dim}mm x ${z.qty}${z.label ? `  [${z.label}]` : ""}`
+        ).join("\n");
+        return `  ${f.name.toUpperCase()} (${matLabel}):\n${rows}`;
+      }),
+    ].join("\n");
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(lines).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2200);
+      }).catch(() => fallbackCopy(lines));
+    } else {
+      fallbackCopy(lines);
+    }
+  };
+
+  const fallbackCopy = (text) => {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try { document.execCommand("copy"); } catch(e) {}
+    document.body.removeChild(ta);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2200);
+  };
+
+  // ── Styles ─────────────────────────────────────────────────────────
+  const S = {
+    app: { minHeight: "100vh", background: "#eef1f5" },
+    hdr: { background: NAVY, padding: "14px 16px 0", boxShadow: "0 3px 16px rgba(0,0,0,0.35)" },
+    hdrTop: { display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 12 },
+    brand: { color: "#fff", fontSize: 15, fontWeight: 700, letterSpacing: 3, textTransform: "uppercase" },
+    brandSub: { color: "#5a90bb", fontSize: 9, letterSpacing: 3, display: "block", marginTop: 1 },
+    tabs: { display: "flex", gap: 2 },
+    tab: active => ({
+      padding: "12px 20px",
+      background: active ? "#eef1f5" : "transparent",
+      color: active ? NAVY : "#5a90bb",
+      border: "none", borderRadius: "6px 6px 0 0",
+      fontSize: 11, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase", cursor: "pointer",
+    }),
+    card: {
+      background: "#fff", borderRadius: 8,
+      boxShadow: "0 1px 6px rgba(0,0,0,0.07)",
+      margin: "12px 12px 0", overflow: "hidden",
+    },
+    cardHdr: (color = NAVY) => ({
+      background: color, color: "#fff",
+      padding: "10px 14px",
+      fontSize: 10, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase",
+      display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8,
+    }),
+    inp: {
+      padding: "11px 12px", border: "1.5px solid #dde1e7", borderRadius: 6,
+      fontSize: 14, background: "#fafbfc",
+      outline: "none", width: "100%",
+    },
+    lbl: {
+      fontSize: 9, fontWeight: 700, letterSpacing: 2, color: "#7a8099",
+      textTransform: "uppercase", display: "block", marginBottom: 5,
+    },
+    btn: (bg = ACCENT) => ({
+      background: bg, color: "#fff", border: "none",
+      borderRadius: 6, padding: "10px 16px",
+      fontSize: 11, fontWeight: 700, letterSpacing: 1.5, textTransform: "uppercase", cursor: "pointer",
+    }),
+    footer: {
+      position: "fixed", bottom: 0, left: 0, right: 0,
+      background: NAVY, padding: "12px 16px",
+      display: "flex", alignItems: "center", justifyContent: "space-between",
+      boxShadow: "0 -4px 20px rgba(0,0,0,0.3)", zIndex: 100,
+    },
+  };
+
+  return (
+    <div style={S.app}>
+
+      {/* Header */}
+      <div style={S.hdr}>
+        <div style={S.hdrTop}>
+          <div>
+            <span style={S.brand}>SA Cladding</span>
+            <span style={S.brandSub}>Panel Count Calculator</span>
+          </div>
+          {totalPanels > 0 && (
+            <div style={{ textAlign: "right", paddingTop: 2 }}>
+              <div style={{ color: "#5a90bb", fontSize: 9, letterSpacing: 1 }}>TOTAL PANELS</div>
+              <div style={{ color: GOLD, fontWeight: 700, fontSize: 22 }}>{totalPanels}</div>
+            </div>
+          )}
+        </div>
+        <div style={S.tabs}>
+          {[["enter","Enter"],["summary","Summary"]].map(([id, label]) => (
+            <button key={id} style={S.tab(tab === id)} onClick={() => setTab(id)}>{label}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* ══ ENTER TAB ══════════════════════════════════════════════════ */}
+      {tab === "enter" && (
+        <div style={{ paddingBottom: 110 }}>
+
+          {/* Job details */}
+          <div style={S.card}>
+            <div style={S.cardHdr()}>Job Details</div>
+            <div style={{ padding: 12, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <div style={{ gridColumn: "1/-1" }}>
+                <label style={S.lbl}>Job / Address</label>
+                <input style={S.inp} value={jobName}
+                  onChange={e => setJobName(e.target.value)}
+                  placeholder="e.g. Lucas — Greenside Ave" />
+              </div>
+              <div>
+                <label style={S.lbl}>Date</label>
+                <input style={S.inp} type="date" value={date} onChange={e => setDate(e.target.value)} />
+              </div>
+              <div>
+                <label style={S.lbl}>Team Leader</label>
+                <input style={S.inp} value={teamLeader}
+                  onChange={e => setTeamLeader(e.target.value)} placeholder="Name" />
+              </div>
+            </div>
+          </div>
+
+          {/* Hint */}
+          <div style={{ margin: "12px 12px 0", background: "#1a2f4a", borderRadius: 8, padding: "10px 14px" }}>
+            <div style={{ color: GOLD, fontSize: 9, fontWeight: 700, letterSpacing: 2, marginBottom: 6 }}>HOW TO ENTER</div>
+            <div style={{ color: "#8ab0cc", fontSize: 12, lineHeight: 2.1 }}>
+              <span style={{ color: "#fff" }}>2850×3</span>{"  →  "}3 panels at 2850mm<br />
+              <span style={{ color: "#fff" }}>1800×1 under window</span>{"  →  "}location tagged<br />
+              <span style={{ color: "#fff" }}>2.7×8 top plate</span>{"  →  "}metres auto-converts<br />
+              <span style={{ color: "#aaa", fontSize: 10 }}>Anything after the numbers = location label</span>
+            </div>
+          </div>
+
+          {/* Elevation faces */}
+          {faces.map((face) => {
+            const pf = parsedFaces.find(p => p.id === face.id);
+            const zones = pf ? pf.zones : [];
+            const errors = pf ? pf.errors : [];
+            const faceTotal = zones.reduce((s, z) => s + (isNaN(z.qty) ? 0 : z.qty), 0);
+
+            return (
+              <div key={face.id} style={{ ...S.card, border: `2px solid ${face.color}` }}>
+
+                {/* Face header */}
+                <div style={S.cardHdr(face.color)}>
+                  <input
+                    value={face.name}
+                    onChange={e => updateFace(face.id, "name", e.target.value)}
+                    placeholder="Elevation name"
+                    style={{
+                      background: "transparent", border: "none", color: "#fff",
+                      fontSize: 13, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase",
+                      outline: "none", flex: 1, minWidth: 0,
+                    }}
+                  />
+                  <span style={{
+                    background: "#ffffff22", color: "#fff",
+                    borderRadius: 4, padding: "2px 8px",
+                    fontSize: 10, fontWeight: 700, letterSpacing: 1,
+                    flexShrink: 0,
+                  }}>
+                    {(MAT[face.material] || MAT.other).label}
+                  </span>
+                  {faceTotal > 0 && (
+                    <span style={{ color: "#ffffffdd", fontSize: 13, fontWeight: 700, flexShrink: 0 }}>
+                      {faceTotal} panels
+                    </span>
+                  )}
+                  {faces.length > 1 && (
+                    <button onClick={() => removeFace(face.id)} style={{
+                      background: "#ffffff22", color: "#fff", border: "none",
+                      borderRadius: 4, padding: "4px 10px", fontSize: 14, cursor: "pointer",
+                    }}>✕</button>
+                  )}
+                </div>
+
+
+                {/* Material selector */}
+                <div style={{ padding: "8px 12px 4px", display: "flex", alignItems: "center", gap: 8 }}>
+                  <label style={{ ...S.lbl, marginBottom: 0, flexShrink: 0 }}>Material</label>
+                  <select
+                    value={face.material}
+                    onChange={e => updateFace(face.id, "material", e.target.value)}
+                    style={{
+                      ...S.inp, width: "auto", flex: 1,
+                      padding: "8px 10px", fontSize: 13, fontWeight: 700,
+                      color: (MAT[face.material] || MAT.other).color,
+                      borderColor: (MAT[face.material] || MAT.other).color,
+                      borderWidth: 2, borderRadius: 6,
+                    }}
+                  >
+                    {MATERIALS.map(m => (
+                      <option key={m.id} value={m.id}>{m.label}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Textarea + mic */}
+                <div style={{ padding: "10px 12px 6px" }}>
+                  {/* Label + mic button row */}
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                    <label style={{ ...S.lbl, marginBottom: 0 }}>size × qty  + optional location</label>
+                    {voiceSupported ? (
+                      <button
+                        onClick={() => startVoice(face.id)}
+                        style={{
+                          background: listeningId === face.id ? "#C0392B" : face.color,
+                          color: "#fff",
+                          border: "none",
+                          borderRadius: 8,
+                          // Large touch target — minimum 48px height for Samsung
+                          minWidth: 90,
+                          minHeight: 48,
+                          padding: "10px 16px",
+                          fontSize: 14,
+                          fontWeight: 700,
+                          cursor: "pointer",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          gap: 6,
+                          flexShrink: 0,
+                          boxShadow: listeningId === face.id
+                            ? "0 0 0 4px rgba(192,57,43,0.3)"
+                            : "0 2px 6px rgba(0,0,0,0.15)",
+                          WebkitTapHighlightColor: "transparent",
+                          touchAction: "manipulation",
+                          transition: "box-shadow 0.15s",
+                        }}
+                      >
+                        {listeningId === face.id ? (
+                          <>
+                            <span style={{
+                              width: 10, height: 10, borderRadius: "50%",
+                              background: "#fff",
+                              display: "inline-block",
+                              animation: "pulse 0.7s ease-in-out infinite alternate",
+                            }} />
+                            Stop
+                          </>
+                        ) : (
+                          <span>&#127908; Speak</span>
+                        )}
+                      </button>
+                    ) : (
+                      <span style={{ fontSize: 10, color: "#aaa" }}>Voice N/A — use Chrome</span>
+                    )}
+                  </div>
+
+                  {/* Voice status / hint bar */}
+                  {listeningId === face.id && (
+                    <div style={{
+                      background: "#fff0f0", border: "2px solid #C0392B",
+                      borderRadius: 6, padding: "9px 12px", marginBottom: 7,
+                      fontSize: 12, color: "#C0392B", fontWeight: 700,
+                      display: "flex", alignItems: "center", gap: 8,
+                    }}>
+                      <span style={{
+                        width: 10, height: 10, borderRadius: "50%", background: "#C0392B",
+                        display: "inline-block", flexShrink: 0,
+                        animation: "pulse 0.7s ease-in-out infinite alternate",
+                      }} />
+                      Say: <strong>"2850 by 3"</strong> or <strong>"2200 by 5 under window"</strong>
+                    </div>
+                  )}
+                  {voiceStatus && listeningId !== face.id && (
+                    <div style={{
+                      background: voiceStatus.startsWith("Got") ? "#f0fff4" : "#fff8f0",
+                      border: `1.5px solid ${voiceStatus.startsWith("Got") ? "#1A7A4A" : WARN}`,
+                      borderRadius: 6, padding: "7px 12px", marginBottom: 7,
+                      fontSize: 11, color: voiceStatus.startsWith("Got") ? "#1A7A4A" : WARN,
+                      fontWeight: 600,
+                    }}>
+                      {voiceStatus}
+                    </div>
+                  )}
+
+                  <textarea
+                    value={face.text}
+                    onChange={e => updateFace(face.id, "text", e.target.value)}
+                    placeholder={"2850×3\n2220×5 above garage\n1800×1 under window\n2850×3"}
+                    rows={Math.max(5, face.text.split("\n").length + 1)}
+                    style={{
+                      ...S.inp, resize: "none",
+                      lineHeight: 2.1, fontSize: 18, fontWeight: 600,
+                      borderColor: listeningId === face.id ? "#C0392B" : errors.length ? WARN : "#dde1e7",
+                      borderWidth: listeningId === face.id ? 2 : 1.5,
+                    }}
+                  />
+                  {errors.length > 0 && (
+                    <div style={{ color: WARN, fontSize: 10, marginTop: 3 }}>
+                      ⚠ {errors.length} line{errors.length > 1 ? "s" : ""} couldn't be read — check format
+                    </div>
+                  )}
+                </div>
+
+                {/* Zone table */}
+                {zones.length > 0 && (
+                  <div style={{ margin: "0 12px 12px", borderRadius: 6, overflow: "hidden", border: "1px solid #e0e4ee" }}>
+                    {/* Column headers */}
+                    <div style={{
+                      display: "grid", gridTemplateColumns: "100px 60px 1fr",
+                      background: "#f0f4ff", padding: "6px 10px", borderBottom: "1px solid #e0e4ee",
+                    }}>
+                      {["Size (mm)", "Qty", "Location"].map((h, i) => (
+                        <div key={i} style={{
+                          fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: "#7a8099",
+                          textTransform: "uppercase", textAlign: i === 1 ? "center" : "left",
+                        }}>{h}</div>
+                      ))}
+                    </div>
+
+                    {zones.map((z, i) => (
+                      <div key={i} style={{
+                        display: "grid", gridTemplateColumns: "100px 60px 1fr",
+                        padding: "9px 10px",
+                        borderBottom: i < zones.length - 1 ? "1px solid #eee" : "none",
+                        background: i % 2 === 0 ? "#fff" : "#fafbfc",
+                        alignItems: "center",
+                      }}>
+                        <div style={{ fontWeight: 700, fontSize: 16, color: face.color }}>{z.dim}</div>
+                        <div style={{ textAlign: "center", fontWeight: 700, fontSize: 20, color: NAVY }}>{z.qty}</div>
+                        <div style={{ paddingLeft: 6 }}>
+                          {z.label ? (
+                            <span style={{
+                              background: face.color + "18", color: face.color,
+                              border: `1px solid ${face.color}44`, borderRadius: 4,
+                              padding: "3px 8px", fontSize: 12, fontWeight: 600,
+                            }}>{z.label}</span>
+                          ) : (
+                            <span style={{ color: "#ccc", fontSize: 11 }}>—</span>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+
+                    {/* Face total */}
+                    <div style={{
+                      display: "grid", gridTemplateColumns: "100px 60px 1fr",
+                      padding: "9px 10px",
+                      background: face.color + "18",
+                      borderTop: `2px solid ${face.color}`,
+                    }}>
+                      <div style={{ fontWeight: 700, fontSize: 11, color: face.color, textTransform: "uppercase", letterSpacing: 1, alignSelf: "center" }}>
+                        Total
+                      </div>
+                      <div style={{ textAlign: "center", fontWeight: 700, fontSize: 20, color: face.color }}>{faceTotal}</div>
+                      <div />
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          <div style={{ padding: "14px 12px 0" }}>
+            <button style={{ ...S.btn(NAVY), width: "100%", padding: 14, fontSize: 12 }} onClick={addFace}>
+              + Add Elevation Face
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ══ SUMMARY TAB ════════════════════════════════════════════════ */}
+      {tab === "summary" && (
+        <div style={{ paddingBottom: 100 }}>
+
+          <div style={S.card}>
+            <div style={S.cardHdr()}>
+              <span>{jobName || "Untitled Job"}</span>
+              <span style={{ fontWeight: 400, fontSize: 9, color: "#5a90bb" }}>{teamLeader || "—"} · {date}</span>
+            </div>
+          </div>
+
+          {/* Grand totals */}
+          <div style={S.card}>
+            <div style={S.cardHdr()}>
+              Total Panels by Size
+              <span style={{ color: GOLD, fontWeight: 700, fontSize: 13 }}>{totalPanels} panels</span>
+            </div>
+
+            <div style={{
+              display: "grid", gridTemplateColumns: "100px 60px 1fr",
+              background: "#f0f4ff", padding: "6px 14px", borderBottom: "1px solid #e0e4ee",
+            }}>
+              {["Size (mm)", "Total", "Where"].map((h, i) => (
+                <div key={i} style={{
+                  fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: "#7a8099",
+                  textTransform: "uppercase", textAlign: i === 1 ? "center" : "left",
+                }}>{h}</div>
+              ))}
+            </div>
+
+            {grandTotals.map((row, i) => (
+              <div key={row.dim} style={{
+                display: "grid", gridTemplateColumns: "100px 60px 1fr",
+                padding: "11px 14px",
+                borderBottom: i < grandTotals.length - 1 ? "1px solid #eee" : "none",
+                background: i % 2 === 0 ? "#fff" : "#fafbfc",
+                alignItems: "start",
+              }}>
+                <div style={{ fontWeight: 700, fontSize: 22, color: NAVY, letterSpacing: -0.5, paddingTop: 2 }}>
+                  {row.dim}<span style={{ fontSize: 11, color: "#aaa", fontWeight: 400 }}>mm</span>
+                </div>
+                <div style={{ textAlign: "center", fontWeight: 700, fontSize: 28, color: ACCENT }}>{row.qty}</div>
+                <div style={{ paddingLeft: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+                  {row.entries.map((e, ei) => (
+                    <div key={ei} style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11, color: "#555", flexWrap: "wrap" }}>
+                        <span style={{ width: 8, height: 8, borderRadius: "50%", background: e.color, display: "inline-block", flexShrink: 0 }} />
+                        {e.faceName}
+                        <span style={{ color: "#aaa" }}>×{e.qty}</span>
+                        {e.material && (
+                          <span style={{
+                            background: (MAT[e.material]||MAT.other).color + "22",
+                            color: (MAT[e.material]||MAT.other).color,
+                            border: `1px solid ${(MAT[e.material]||MAT.other).color}55`,
+                            borderRadius: 3, padding: "1px 5px",
+                            fontSize: 9, fontWeight: 700, letterSpacing: 1,
+                          }}>{(MAT[e.material]||MAT.other).label}</span>
+                        )}
+                      </span>
+                      {e.label && (
+                        <span style={{
+                          background: e.color + "18", color: e.color,
+                          border: `1px solid ${e.color}55`, borderRadius: 4,
+                          padding: "2px 7px", fontSize: 11, fontWeight: 600,
+                        }}>{e.label}</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+
+            {/* Grand total row */}
+            <div style={{
+              display: "grid", gridTemplateColumns: "100px 60px 1fr",
+              padding: "11px 14px", background: NAVY, borderTop: `3px solid ${ACCENT}`,
+            }}>
+              <div style={{ color: "#5a90bb", fontSize: 11, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase", alignSelf: "center" }}>
+                Grand Total
+              </div>
+              <div style={{ textAlign: "center", fontWeight: 700, fontSize: 30, color: GOLD }}>{totalPanels}</div>
+              <div style={{ color: "#5a90bb", fontSize: 11, paddingLeft: 8, alignSelf: "center" }}>panels</div>
+            </div>
+          </div>
+
+          {/* Per elevation */}
+          <div style={S.card}>
+            <div style={S.cardHdr()}>By Elevation</div>
+            {parsedFaces.filter(f => f.zones.length > 0).map((f) => {
+              const total = f.zones.reduce((s, z) => s + z.qty, 0);
+              return (
+                <div key={f.id} style={{ borderLeft: `5px solid ${f.color}`, padding: "11px 14px", borderBottom: "1px solid #eee" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 9 }}>
+                    <div>
+                      <div>
+                      <div style={{ fontWeight: 700, fontSize: 13, color: f.color, textTransform: "uppercase", letterSpacing: 1.5 }}>{f.name}</div>
+                      <div style={{ fontSize: 10, color: "#888", marginTop: 2 }}>{(MAT[f.material] || MAT.other).label}</div>
+                    </div>
+                      <div style={{ fontSize: 10, color: (MATERIALS.find(m => m.id === f.material) || MATERIALS[0]).color, fontWeight: 600, marginTop: 2 }}>
+                        {(MATERIALS.find(m => m.id === f.material) || MATERIALS[0]).label}
+                      </div>
+                    </div>
+                    <div style={{ fontWeight: 700, fontSize: 17, color: NAVY }}>{total} panels</div>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {f.zones.map((z, i) => (
+                      <div key={i} style={{
+                        display: "flex", alignItems: "center", gap: 8,
+                        padding: "6px 8px", background: "#fafbfc",
+                        borderRadius: 5, border: "1px solid #eee",
+                      }}>
+                        <span style={{ fontWeight: 700, fontSize: 15, color: f.color, minWidth: 55 }}>{z.dim}mm</span>
+                        <span style={{ fontWeight: 700, fontSize: 18, color: NAVY, minWidth: 32, textAlign: "center" }}>×{z.qty}</span>
+                        {z.label ? (
+                          <span style={{
+                            background: f.color + "15", color: f.color,
+                            border: `1px solid ${f.color}44`, borderRadius: 4,
+                            padding: "3px 8px", fontSize: 12, fontWeight: 600,
+                          }}>{z.label}</span>
+                        ) : (
+                          <span style={{ color: "#ddd", fontSize: 11 }}>no location</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ height: 12 }} />
+        </div>
+      )}
+
+      {/* Footer */}
+      <div style={S.footer}>
+        <div>
+          <div style={{ color: "#5a90bb", fontSize: 9, letterSpacing: 2, textTransform: "uppercase" }}>Total Panels</div>
+          <div style={{ color: GOLD, fontSize: 26, fontWeight: 700, letterSpacing: -0.5 }}>{totalPanels}</div>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          {tab === "enter" && (
+            <button style={{ ...S.btn(ACCENT), padding: "12px 18px" }} onClick={() => setTab("summary")}>
+              Summary →
+            </button>
+          )}
+          <button style={{ ...S.btn(copied ? SUCCESS : "#2a3a50"), padding: "12px 18px" }} onClick={copySummary}>
+            {copied ? "✓ Copied" : "Copy"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
